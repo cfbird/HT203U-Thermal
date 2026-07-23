@@ -54,7 +54,15 @@ class MainActivity : Activity() {
         Bitmap.createBitmap(Xtherm.WIDTH, Xtherm.HEIGHT, Bitmap.Config.ARGB_8888)
     private val pixels = IntArray(Xtherm.PIXELS)
     private val palette = Xtherm.ironPalette()
-    private val frameU16 = ShortArray(Xtherm.FRAME_U16)
+    private var frameU16 = ShortArray(256 * 520)
+
+    // Negotiation fallback: candidate uncompressed modes, tried in order until frames flow
+    private var candidates: List<Size> = emptyList()
+    private var candIdx = 0
+    @Volatile private var curW = Xtherm.WIDTH
+    @Volatile private var curH = Xtherm.FRAME_HEIGHT
+    @Volatile private var radiometricSeen = false
+    private var triedTallSwitch = false
 
     @Volatile private var highRange = false
     @Volatile private var fahrenheit = false
@@ -72,23 +80,44 @@ class MainActivity : Activity() {
     private val watchdog = object : Runnable {
         override fun run() {
             val helper = cameraHelper
-            if (helper != null && rawModeRequested && framesReceived == 0L) {
-                if (previewRestarts < 2 && helper.isCameraOpened) {
-                    // one gentle kick: renegotiate the stream
-                    previewRestarts++
-                    statusText.text = "No frames — restarting stream (attempt $previewRestarts)…"
-                    try {
-                        helper.stopPreview()
-                        helper.startPreview()
-                    } catch (t: Throwable) {
-                        statusText.text = "Stream restart failed: ${t.message}"
+            if (helper != null && rawModeRequested && helper.isCameraOpened) {
+                if (framesReceived == 0L) {
+                    // negotiation likely failed (libuvc INVALID_MODE) — try the next mode
+                    if (candIdx + 1 < candidates.size) {
+                        candIdx++
+                        applySize(candidates[candIdx], "no frames in previous mode")
+                    } else {
+                        statusText.text =
+                            "No mode delivered frames (last buffer: $lastFrameBytes B) — tap Log and share it"
                     }
-                } else {
-                    statusText.text =
-                        "Stream started but no frames arriving (last buffer: $lastFrameBytes B) — tap Log and share it"
+                } else if (!radiometricSeen && !triedTallSwitch && curH < 384) {
+                    // frames flow but no thermal data found; try a stacked (tall) mode once
+                    triedTallSwitch = true
+                    candidates.firstOrNull { it.height >= 384 }?.let {
+                        applySize(it, "video-only frames, trying stacked mode")
+                    }
                 }
             }
             mainHandler.postDelayed(this, 3000)
+        }
+    }
+
+    private fun applySize(size: Size, reason: String) {
+        val helper = cameraHelper ?: return
+        dlog("applySize ${size.width}x${size.height}@${size.fps} ($reason)")
+        statusText.text = "Trying mode ${size.width}x${size.height}…"
+        try {
+            helper.stopPreview()
+            helper.previewSize = size
+            curW = size.width
+            curH = size.height
+            framesReceived = 0
+            frameCount = 0
+            tempTable = null
+            helper.startPreview()
+        } catch (t: Throwable) {
+            dlog("applySize failed: $t")
+            statusText.text = "Mode switch failed: ${t.message}"
         }
     }
 
@@ -200,26 +229,25 @@ class MainActivity : Activity() {
             dlog("onCameraOpen; supported sizes: " + sizes.joinToString {
                 "type=${it.type} ${it.width}x${it.height}@${it.fps}(${it.fpsList})"
             })
-            val size = pickThermalSize(sizes)
-            if (size == null) {
-                status("No ${Xtherm.WIDTH}x${Xtherm.FRAME_HEIGHT} YUYV mode found — is this an HT-203U? (tap Log)")
+            // Uncompressed (thermal) modes only; prefer stacked 2x196, then single blocks
+            val priority = mapOf(392 to 0, 196 to 1, 400 to 2, 200 to 3, 192 to 4, 384 to 5)
+            candidates = sizes
+                .filter { it.type == UVCCamera.UVC_VS_FRAME_UNCOMPRESSED && it.width == Xtherm.WIDTH }
+                .sortedBy { priority[it.height] ?: 9 }
+                .distinctBy { it.height }
+            if (candidates.isEmpty()) {
+                status("No ${Xtherm.WIDTH}-wide YUYV modes found — is this an HT-203U? (tap Log)")
                 return
             }
-            dlog("chosen size: type=${size.type} ${size.width}x${size.height}@${size.fps}")
-            try {
-                helper.previewSize = size
-            } catch (t: Throwable) {
-                dlog("setPreviewSize failed: $t")
-                status("setPreviewSize failed: ${t.message} (tap Log)")
-                return
-            }
+            dlog("candidates: " + candidates.joinToString { "${it.width}x${it.height}" })
+            candIdx = 0
+            triedTallSwitch = false
+            radiometricSeen = false
             helper.setFrameCallback(frameCallback, UVCCamera.PIXEL_FORMAT_RAW)
             attachSinkIfReady()
-            dlog("startPreview()")
-            helper.startPreview()
-            status("Streaming ${size.width}x${size.height} — switching to raw mode…")
-            rawModeRequested = false
-            // Give the stream a moment to start, then switch to 16-bit radiometric mode
+            applySize(candidates[0], "initial")
+            rawModeRequested = true
+            // Xtherm-style raw command is a no-op on HIKMICRO firmware but harmless
             mainHandler.postDelayed({ enterRawMode() }, 700)
         }
 
@@ -310,66 +338,121 @@ class MainActivity : Activity() {
 
     private fun processFrame(frame: ByteBuffer) {
         lastFrameBytes = frame.remaining()
-        if (framesReceived == 0L) dlog("first frame callback: ${frame.remaining()} B")
-        if (frame.remaining() < Xtherm.FRAME_U16 * 2) return
+        val nU16 = frame.remaining() / 2
+        if (framesReceived == 0L) dlog("first frame: ${frame.remaining()} B in mode ${curW}x${curH}")
+        if (nU16 < Xtherm.PIXELS) return
         framesReceived++
+        frameCount++
+        if (frameU16.size < nU16) frameU16 = ShortArray(nU16)
         frame.order(ByteOrder.LITTLE_ENDIAN)
-        frame.asShortBuffer().get(frameU16, 0, Xtherm.FRAME_U16)
+        frame.asShortBuffer().get(frameU16, 0, nU16)
 
-        val meta = Xtherm.parseMeta(frameU16)
-        if (meta == null) {
-            // Still in visible-video mode: render the YUYV luma so the user sees
-            // *something*, and keep retrying the raw-mode switch (~1x per second)
-            if (rawModeRequested && frameCount % 25 == 0L) {
-                cameraHelper?.getUVCControl()?.setZoomAbsolute(Xtherm.CMD_RAW_MODE)
+        val w = Xtherm.WIDTH
+        val h = if (nU16 % w == 0) nU16 / w else curH
+
+        // 1) Xtherm-style: look for a 4-row meta block after each 192-row image block
+        var k = 1
+        while (k * 196 <= h) {
+            val base = (k - 1) * 196
+            val meta = Xtherm.parseMeta(frameU16, w * (base + Xtherm.HEIGHT))
+            if (meta != null) {
+                if (!radiometricSeen) { radiometricSeen = true; dlog("xtherm meta found in block $k (row $base)") }
+                renderXtherm(meta, w * base)
+                return
             }
-            frameCount++
-            for (i in 0 until Xtherm.PIXELS) {
-                val y = frameU16[i].toInt() and 0xFF   // low byte = luma
-                pixels[i] = (0xFF shl 24) or (y shl 16) or (y shl 8) or y
-            }
-            runOnUiThread {
-                bitmap.setPixels(pixels, 0, Xtherm.WIDTH, 0, 0, Xtherm.WIDTH, Xtherm.HEIGHT)
-                thermalView.setImageBitmap(bitmap)
-                thermalView.invalidate()
-                tempText.text = ""
-                statusText.text =
-                    "video mode · frame $framesReceived · waiting for raw switch (0x8004)"
-            }
-            return
+            k++
         }
 
-        // Rebuild the temperature table every 8 frames (calibration drifts slowly)
+        // 2) HIKMICRO/TC001-style stacked frame: bottom half = raw Kelvin*64, no meta
+        if (h >= 384) {
+            val bottom = w * (h / 2)
+            var mn = 65535; var mx = 0
+            for (i in bottom until bottom + Xtherm.PIXELS) {
+                val v = frameU16[i].toInt() and 0xFFFF
+                if (v < mn) mn = v
+                if (v > mx) mx = v
+            }
+            // plausible temps (-40..500 °C => ~14900..49500 in K*64), non-flat field
+            if (mn in 14000..50000 && mx in 14000..50000 && mx > mn + 16) {
+                if (!radiometricSeen) { radiometricSeen = true; dlog("K/64 radiometric in bottom half (min=$mn max=$mx)") }
+                renderK64(bottom, mn, mx)
+                return
+            }
+        }
+
+        // 3) nothing recognized — show luma of the top block, log stats periodically
+        if (frameCount % 150L == 1L) logFrameStats(w, h)
+        for (i in 0 until Xtherm.PIXELS) {
+            val y = frameU16[i].toInt() and 0xFF
+            pixels[i] = (0xFF shl 24) or (y shl 16) or (y shl 8) or y
+        }
+        show("video ${w}x$h · frame $framesReceived · no thermal data recognized yet", "")
+    }
+
+    private fun renderXtherm(meta: Xtherm.Meta, imageOff: Int) {
         if (tempTable == null || frameCount % 8 == 0L) {
             tempTable = Xtherm.tempTable(meta, highRange)
         }
         val table = tempTable ?: return
-        frameCount++
-
-        // Auto-exposure straight from the camera-computed min/max
         val minRaw = meta.minRaw
         val span = (meta.maxRaw - minRaw).coerceAtLeast(1)
         for (i in 0 until Xtherm.PIXELS) {
-            val v = frameU16[i].toInt() and 0xFFFF
-            val idx = ((v - minRaw) * 255 / span).coerceIn(0, 255)
-            pixels[i] = palette[idx]
+            val v = frameU16[imageOff + i].toInt() and 0xFFFF
+            pixels[i] = palette[((v - minRaw) * 255 / span).coerceIn(0, 255)]
         }
         drawMarker(meta.minX, meta.minY, 0xFF40A0FF.toInt())
         drawMarker(meta.maxX, meta.maxY, 0xFFFF4040.toInt())
         drawMarker(Xtherm.WIDTH / 2, Xtherm.HEIGHT / 2, 0xFFFFFFFF.toInt())
+        show(
+            "radiometric (xtherm) · frame %d · shutter %.1f°C".format(framesReceived, meta.tempShutter),
+            "▼%s  ⌖%s  ▲%s".format(fmt(table[meta.minRaw]), fmt(table[meta.centerRaw]), fmt(table[meta.maxRaw]))
+        )
+    }
 
-        val tMin = table[meta.minRaw]
-        val tMax = table[meta.maxRaw]
-        val tCenter = table[meta.centerRaw]
+    private fun renderK64(offset: Int, mn: Int, mx: Int) {
+        val span = (mx - mn).coerceAtLeast(1)
+        var minI = 0; var maxI = 0
+        for (i in 0 until Xtherm.PIXELS) {
+            val v = frameU16[offset + i].toInt() and 0xFFFF
+            if (v == mn) minI = i
+            if (v == mx) maxI = i
+            pixels[i] = palette[((v - mn) * 255 / span).coerceIn(0, 255)]
+        }
+        val center = frameU16[offset + (Xtherm.HEIGHT / 2) * Xtherm.WIDTH + Xtherm.WIDTH / 2].toInt() and 0xFFFF
+        drawMarker(minI % Xtherm.WIDTH, minI / Xtherm.WIDTH, 0xFF40A0FF.toInt())
+        drawMarker(maxI % Xtherm.WIDTH, maxI / Xtherm.WIDTH, 0xFFFF4040.toInt())
+        drawMarker(Xtherm.WIDTH / 2, Xtherm.HEIGHT / 2, 0xFFFFFFFF.toInt())
+        fun k64(v: Int) = (v / 64.0 - 273.15).toFloat()
+        show(
+            "radiometric (K/64) · frame $framesReceived",
+            "▼%s  ⌖%s  ▲%s".format(fmt(k64(mn)), fmt(k64(center)), fmt(k64(mx)))
+        )
+    }
 
+    private fun logFrameStats(w: Int, h: Int) {
+        fun stats(rowStart: Int, rows: Int): String {
+            var mn = 65535; var mx = 0; var sum = 0L
+            val from = rowStart * w
+            val to = (rowStart + rows) * w
+            for (i in from until to) {
+                val v = frameU16[i].toInt() and 0xFFFF
+                if (v < mn) mn = v
+                if (v > mx) mx = v
+                sum += v
+            }
+            return "rows $rowStart..${rowStart + rows - 1}: min=$mn max=$mx mean=${sum / (to - from)}"
+        }
+        dlog("frame ${w}x$h stats: " + stats(0, minOf(192, h)) +
+                (if (h >= 384) " | " + stats(h / 2, minOf(192, h - h / 2)) else ""))
+    }
+
+    private fun show(statusMsg: String, temps: String) {
         runOnUiThread {
             bitmap.setPixels(pixels, 0, Xtherm.WIDTH, 0, 0, Xtherm.WIDTH, Xtherm.HEIGHT)
             thermalView.setImageBitmap(bitmap)
             thermalView.invalidate()
-            tempText.text = "▼%s  ⌖%s  ▲%s".format(fmt(tMin), fmt(tCenter), fmt(tMax))
-            statusText.text = "radiometric · frame %d · shutter %.1f°C · fpa %.1f°C".format(
-                framesReceived, meta.tempShutter, meta.tempFpa
-            )
+            tempText.text = temps
+            statusText.text = statusMsg
         }
     }
 

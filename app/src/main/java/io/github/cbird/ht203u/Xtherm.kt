@@ -70,12 +70,12 @@ object Xtherm {
         if (this.isFinite() && this in min..max) this else default
 
     /**
-     * Parse the 4 metadata rows. Returns null if the values are implausible —
-     * which is the case while the camera is still in visible/video mode.
+     * Parse 4 metadata rows located at u16 offset [metaOffset]. Returns null if
+     * the values are implausible — e.g. plain video data.
      */
-    fun parseMeta(frame: ShortArray): Meta? {
-        if (frame.size < FRAME_U16) return null
-        val m = PIXELS
+    fun parseMeta(frame: ShortArray, metaOffset: Int = PIXELS): Meta? {
+        if (frame.size < metaOffset + META_ROWS * WIDTH) return null
+        val m = metaOffset
 
         val maxX = u16(frame, m + 2)
         val maxY = u16(frame, m + 3)
