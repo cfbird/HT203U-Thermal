@@ -37,9 +37,21 @@ class MainActivity : Activity() {
     @Volatile private var highRange = false
     @Volatile private var fahrenheit = false
     @Volatile private var rawModeRequested = false
+    @Volatile private var framesReceived = 0L
+    @Volatile private var lastFrameBytes = 0
 
     private var tempTable: FloatArray? = null
     private var frameCount = 0L
+
+    private val watchdog = object : Runnable {
+        override fun run() {
+            if (cameraHelper != null && rawModeRequested && framesReceived == 0L) {
+                statusText.text =
+                    "Stream started but no frames arriving (last buffer: $lastFrameBytes B) — try replugging"
+            }
+            mainHandler.postDelayed(this, 3000)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -71,10 +83,12 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart()
         initCameraHelper()
+        mainHandler.postDelayed(watchdog, 3000)
     }
 
     override fun onStop() {
         super.onStop()
+        mainHandler.removeCallbacks(watchdog)
         cameraHelper?.release()
         cameraHelper = null
     }
@@ -94,7 +108,9 @@ class MainActivity : Activity() {
         }
 
         override fun onDeviceOpen(device: UsbDevice, isFirstOpen: Boolean) {
-            cameraHelper?.openCamera()
+            val param = com.serenegiant.usb.UVCParam()
+            param.quirks = UVCCamera.getRecommendedPlatformQuirks()
+            cameraHelper?.openCamera(param)
         }
 
         override fun onCameraOpen(device: UsbDevice) {
@@ -137,7 +153,7 @@ class MainActivity : Activity() {
         mainHandler.postDelayed({
             cameraHelper?.getUVCControl()?.setZoomAbsolute(Xtherm.CMD_CALIBRATE)
         }, 400)
-        status("Raw radiometric mode")
+        status("raw-mode command sent — waiting for radiometric frames…")
     }
 
     private fun pickThermalSize(sizes: List<Size>): Size? =
@@ -155,17 +171,32 @@ class MainActivity : Activity() {
     }
 
     private fun processFrame(frame: ByteBuffer) {
+        lastFrameBytes = frame.remaining()
         if (frame.remaining() < Xtherm.FRAME_U16 * 2) return
+        framesReceived++
         frame.order(ByteOrder.LITTLE_ENDIAN)
         frame.asShortBuffer().get(frameU16, 0, Xtherm.FRAME_U16)
 
         val meta = Xtherm.parseMeta(frameU16)
         if (meta == null) {
-            // Still in visible-video mode; retry the mode switch occasionally
-            if (rawModeRequested && frameCount % 50 == 0L) {
-                mainHandler.post { enterRawMode() }
+            // Still in visible-video mode: render the YUYV luma so the user sees
+            // *something*, and keep retrying the raw-mode switch (~1x per second)
+            if (rawModeRequested && frameCount % 25 == 0L) {
+                cameraHelper?.getUVCControl()?.setZoomAbsolute(Xtherm.CMD_RAW_MODE)
             }
             frameCount++
+            for (i in 0 until Xtherm.PIXELS) {
+                val y = frameU16[i].toInt() and 0xFF   // low byte = luma
+                pixels[i] = (0xFF shl 24) or (y shl 16) or (y shl 8) or y
+            }
+            runOnUiThread {
+                bitmap.setPixels(pixels, 0, Xtherm.WIDTH, 0, 0, Xtherm.WIDTH, Xtherm.HEIGHT)
+                thermalView.setImageBitmap(bitmap)
+                thermalView.invalidate()
+                tempText.text = ""
+                statusText.text =
+                    "video mode · frame $framesReceived · waiting for raw switch (0x8004)"
+            }
             return
         }
 
@@ -197,8 +228,8 @@ class MainActivity : Activity() {
             thermalView.setImageBitmap(bitmap)
             thermalView.invalidate()
             tempText.text = "▼%s  ⌖%s  ▲%s".format(fmt(tMin), fmt(tCenter), fmt(tMax))
-            statusText.text = "raw mode · shutter %.1f°C · fpa %.1f°C".format(
-                meta.tempShutter, meta.tempFpa
+            statusText.text = "radiometric · frame %d · shutter %.1f°C · fpa %.1f°C".format(
+                framesReceived, meta.tempShutter, meta.tempFpa
             )
         }
     }
