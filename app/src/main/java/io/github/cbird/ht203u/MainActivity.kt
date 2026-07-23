@@ -4,11 +4,12 @@ import android.Manifest
 import android.app.Activity
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.SurfaceTexture
 import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.graphics.SurfaceTexture
 import android.view.TextureView
 import android.view.WindowManager
 import android.widget.Button
@@ -34,7 +35,7 @@ class MainActivity : Activity() {
         android.util.Log.i(TAG, m)
         synchronized(traceBuf) {
             traceBuf.addLast(m)
-            while (traceBuf.size > 200) traceBuf.removeFirst()
+            while (traceBuf.size > 250) traceBuf.removeFirst()
         }
     }
 
@@ -50,51 +51,41 @@ class MainActivity : Activity() {
     @Volatile private var sinkTexture: SurfaceTexture? = null
     @Volatile private var sinkAttached = false
 
-    private val bitmap: Bitmap =
-        Bitmap.createBitmap(Xtherm.WIDTH, Xtherm.HEIGHT, Bitmap.Config.ARGB_8888)
-    private val pixels = IntArray(Xtherm.PIXELS)
+    private var bitmap: Bitmap = Bitmap.createBitmap(Xtherm.WIDTH, Xtherm.HEIGHT, Bitmap.Config.ARGB_8888)
+    private var pixels = IntArray(Xtherm.PIXELS)
     private val palette = Xtherm.ironPalette()
     private var frameU16 = ShortArray(256 * 520)
 
-    // Negotiation fallback: candidate uncompressed modes, tried in order until frames flow
+    // Mode negotiation fallback
     private var candidates: List<Size> = emptyList()
     private var candIdx = 0
     @Volatile private var curW = Xtherm.WIDTH
     @Volatile private var curH = Xtherm.FRAME_HEIGHT
+    @Volatile private var curType = UVCCamera.UVC_VS_FRAME_UNCOMPRESSED
     @Volatile private var radiometricSeen = false
-    private var triedTallSwitch = false
 
     @Volatile private var highRange = false
     @Volatile private var fahrenheit = false
     @Volatile private var rawModeRequested = false
     @Volatile private var framesReceived = 0L
     @Volatile private var lastFrameBytes = 0
+    @Volatile private var permissionRetried = false
+    @Volatile private var requestingDevice = false
 
     private var tempTable: FloatArray? = null
     private var frameCount = 0L
-
-    private var previewRestarts = 0
-    @Volatile private var permissionRetried = false
-    @Volatile private var requestingDevice = false
 
     private val watchdog = object : Runnable {
         override fun run() {
             val helper = cameraHelper
             if (helper != null && rawModeRequested && helper.isCameraOpened) {
                 if (framesReceived == 0L) {
-                    // negotiation likely failed (libuvc INVALID_MODE) — try the next mode
                     if (candIdx + 1 < candidates.size) {
                         candIdx++
                         applySize(candidates[candIdx], "no frames in previous mode")
                     } else {
                         statusText.text =
                             "No mode delivered frames (last buffer: $lastFrameBytes B) — tap Log and share it"
-                    }
-                } else if (!radiometricSeen && !triedTallSwitch && curH < 384) {
-                    // frames flow but no thermal data found; try a stacked (tall) mode once
-                    triedTallSwitch = true
-                    candidates.firstOrNull { it.height >= 384 }?.let {
-                        applySize(it, "video-only frames, trying stacked mode")
                     }
                 }
             }
@@ -104,16 +95,23 @@ class MainActivity : Activity() {
 
     private fun applySize(size: Size, reason: String) {
         val helper = cameraHelper ?: return
-        dlog("applySize ${size.width}x${size.height}@${size.fps} ($reason)")
-        statusText.text = "Trying mode ${size.width}x${size.height}…"
+        dlog("applySize type=${size.type} ${size.width}x${size.height}@${size.fps} ($reason)")
+        statusText.text = "Trying mode ${size.width}x${size.height} (type ${size.type})…"
         try {
             helper.stopPreview()
             helper.previewSize = size
             curW = size.width
             curH = size.height
+            curType = size.type
             framesReceived = 0
             frameCount = 0
             tempTable = null
+            // MJPEG frames are decoded to NV21 by the lib; uncompressed passes through raw
+            helper.setFrameCallback(
+                frameCallback,
+                if (size.type == UVCCamera.UVC_VS_FRAME_MJPEG) UVCCamera.PIXEL_FORMAT_NV21
+                else UVCCamera.PIXEL_FORMAT_RAW
+            )
             helper.startPreview()
         } catch (t: Throwable) {
             dlog("applySize failed: $t")
@@ -131,19 +129,6 @@ class MainActivity : Activity() {
         tempText = findViewById(R.id.tempText)
         btnRange = findViewById(R.id.btnRange)
         btnUnit = findViewById(R.id.btnUnit)
-        statusText.setOnClickListener { retryDevice() }
-        sinkView = findViewById(R.id.sinkView)
-        sinkView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
-                sinkTexture = st
-                attachSinkIfReady()
-            }
-            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
-            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
-                sinkTexture = null; sinkAttached = false; return true
-            }
-            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
-        }
 
         findViewById<Button>(R.id.btnCalibrate).setOnClickListener {
             cameraHelper?.getUVCControl()?.setZoomAbsolute(Xtherm.CMD_CALIBRATE)
@@ -159,6 +144,19 @@ class MainActivity : Activity() {
         btnUnit.setOnClickListener {
             fahrenheit = !fahrenheit
             btnUnit.setText(if (fahrenheit) R.string.unit_f else R.string.unit_c)
+        }
+        statusText.setOnClickListener { retryDevice() }
+        sinkView = findViewById(R.id.sinkView)
+        sinkView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                sinkTexture = st
+                attachSinkIfReady()
+            }
+            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                sinkTexture = null; sinkAttached = false; return true
+            }
+            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
         }
     }
 
@@ -195,6 +193,7 @@ class MainActivity : Activity() {
         mainHandler.removeCallbacks(watchdog)
         cameraHelper?.release()
         cameraHelper = null
+        sinkAttached = false
     }
 
     private fun initCameraHelper() {
@@ -211,14 +210,13 @@ class MainActivity : Activity() {
             if (requestingDevice) return
             requestingDevice = true
             status("Camera attached — requesting permission…")
-            // Triggers the system USB permission dialog (required on GrapheneOS)
             cameraHelper?.selectDevice(device)
         }
 
         override fun onDeviceOpen(device: UsbDevice, isFirstOpen: Boolean) {
             requestingDevice = false
+            dumpDescriptors(device)
             val param = com.serenegiant.usb.UVCParam()
-            // Thermal cams routinely misreport isochronous bandwidth; always fix it up
             param.quirks = UVCCamera.UVC_QUIRK_FIX_BANDWIDTH
             cameraHelper?.openCamera(param)
         }
@@ -227,27 +225,30 @@ class MainActivity : Activity() {
             val helper = cameraHelper ?: return
             val sizes = helper.supportedSizeList
             dlog("onCameraOpen; supported sizes: " + sizes.joinToString {
-                "type=${it.type} ${it.width}x${it.height}@${it.fps}(${it.fpsList})"
+                "type=${it.type} ${it.width}x${it.height}@${it.fps}"
             })
-            // Uncompressed (thermal) modes only; prefer stacked 2x196, then single blocks
-            val priority = mapOf(392 to 0, 196 to 1, 400 to 2, 200 to 3, 192 to 4, 384 to 5)
-            candidates = sizes
-                .filter { it.type == UVCCamera.UVC_VS_FRAME_UNCOMPRESSED && it.width == Xtherm.WIDTH }
-                .sortedBy { priority[it.height] ?: 9 }
-                .distinctBy { it.height }
+            // Uncompressed thermal modes first (any width), then MJPEG as video fallback
+            val uncompPrio = mapOf(392 to 0, 196 to 1, 400 to 2, 200 to 3, 192 to 4)
+            val uncomp = sizes
+                .filter { it.type == UVCCamera.UVC_VS_FRAME_UNCOMPRESSED }
+                .sortedBy { (if (it.width == 256) 0 else 10) + (uncompPrio[it.height] ?: 9) }
+                .distinctBy { it.width to it.height }
+            val mjpegPrio = mapOf(320 to 0, 160 to 1, 360 to 2)
+            val mjpeg = sizes
+                .filter { it.type == UVCCamera.UVC_VS_FRAME_MJPEG }
+                .sortedBy { mjpegPrio[it.height] ?: 9 }
+                .distinctBy { it.width to it.height }
+            candidates = uncomp + mjpeg
             if (candidates.isEmpty()) {
-                status("No ${Xtherm.WIDTH}-wide YUYV modes found — is this an HT-203U? (tap Log)")
+                status("No video modes found at all — tap Log")
                 return
             }
-            dlog("candidates: " + candidates.joinToString { "${it.width}x${it.height}" })
+            dlog("candidates: " + candidates.joinToString { "t${it.type} ${it.width}x${it.height}" })
             candIdx = 0
-            triedTallSwitch = false
             radiometricSeen = false
-            helper.setFrameCallback(frameCallback, UVCCamera.PIXEL_FORMAT_RAW)
             attachSinkIfReady()
             applySize(candidates[0], "initial")
             rawModeRequested = true
-            // Xtherm-style raw command is a no-op on HIKMICRO firmware but harmless
             mainHandler.postDelayed({ enterRawMode() }, 700)
         }
 
@@ -274,6 +275,22 @@ class MainActivity : Activity() {
             } else {
                 status("USB permission denied — tap this text to retry, or replug the camera")
             }
+        }
+    }
+
+    private fun dumpDescriptors(device: UsbDevice) {
+        try {
+            val um = getSystemService(USB_SERVICE) as UsbManager
+            val conn = um.openDevice(device)
+            if (conn == null) {
+                dlog("descriptor dump: openDevice returned null")
+                return
+            }
+            val raw = conn.rawDescriptors
+            conn.close()
+            if (raw != null) dlog(UsbDesc.summarize(raw)) else dlog("descriptor dump: null")
+        } catch (t: Throwable) {
+            dlog("descriptor dump failed: $t")
         }
     }
 
@@ -314,79 +331,107 @@ class MainActivity : Activity() {
         }
         control.setZoomAbsolute(Xtherm.CMD_RAW_MODE)
         dlog("readback zoom=0x%x".format(runCatching { control.zoomAbsolute }.getOrDefault(-1)))
-        rawModeRequested = true
-        // Shutter calibration shortly after entering raw mode
         mainHandler.postDelayed({
             cameraHelper?.getUVCControl()?.setZoomAbsolute(Xtherm.CMD_CALIBRATE)
         }, 400)
-        status("raw-mode command sent — waiting for radiometric frames…")
     }
-
-    private fun pickThermalSize(sizes: List<Size>): Size? =
-        sizes.firstOrNull {
-            it.type == UVCCamera.UVC_VS_FRAME_UNCOMPRESSED &&
-                    it.width == Xtherm.WIDTH && it.height == Xtherm.FRAME_HEIGHT
-        }
 
     private val frameCallback = com.serenegiant.usb.IFrameCallback { frame: ByteBuffer ->
         try {
             processFrame(frame)
         } catch (t: Throwable) {
+            dlog("frame error: $t")
             status("Frame error: ${t.message}")
         }
     }
 
+    private fun ensurePixels(n: Int) {
+        if (pixels.size < n) pixels = IntArray(n)
+    }
+
     private fun processFrame(frame: ByteBuffer) {
         lastFrameBytes = frame.remaining()
-        val nU16 = frame.remaining() / 2
-        if (framesReceived == 0L) dlog("first frame: ${frame.remaining()} B in mode ${curW}x${curH}")
-        if (nU16 < Xtherm.PIXELS) return
+        if (framesReceived == 0L) {
+            dlog("first frame: ${frame.remaining()} B in mode t$curType ${curW}x${curH}")
+        }
         framesReceived++
         frameCount++
+
+        if (curType == UVCCamera.UVC_VS_FRAME_MJPEG) {
+            renderMjpegLuma(frame)
+            return
+        }
+
+        val nU16 = frame.remaining() / 2
+        if (nU16 < curW * 100) return
         if (frameU16.size < nU16) frameU16 = ShortArray(nU16)
         frame.order(ByteOrder.LITTLE_ENDIAN)
         frame.asShortBuffer().get(frameU16, 0, nU16)
 
-        val w = Xtherm.WIDTH
+        val w = curW
         val h = if (nU16 % w == 0) nU16 / w else curH
 
-        // 1) Xtherm-style: look for a 4-row meta block after each 192-row image block
-        var k = 1
-        while (k * 196 <= h) {
-            val base = (k - 1) * 196
-            val meta = Xtherm.parseMeta(frameU16, w * (base + Xtherm.HEIGHT))
-            if (meta != null) {
-                if (!radiometricSeen) { radiometricSeen = true; dlog("xtherm meta found in block $k (row $base)") }
-                renderXtherm(meta, w * base)
-                return
+        // 1) Xtherm-style meta blocks (256-wide layouts only)
+        if (w == 256) {
+            var k = 1
+            while (k * 196 <= h) {
+                val base = (k - 1) * 196
+                val meta = Xtherm.parseMeta(frameU16, w * (base + Xtherm.HEIGHT))
+                if (meta != null) {
+                    if (!radiometricSeen) {
+                        radiometricSeen = true; dlog("xtherm meta found in block $k (row $base)")
+                    }
+                    renderXtherm(meta, w * base)
+                    return
+                }
+                k++
             }
-            k++
         }
 
-        // 2) HIKMICRO/TC001-style stacked frame: bottom half = raw Kelvin*64, no meta
-        if (h >= 384) {
-            val bottom = w * (h / 2)
+        // 2) Stacked frame: bottom half raw Kelvin*64 (TC001/HIKMICRO style)
+        if (h >= 2 * 190) {
+            val rows = h / 2
+            val bottom = w * rows
+            val count = w * minOf(rows, h - rows)
             var mn = 65535; var mx = 0
-            for (i in bottom until bottom + Xtherm.PIXELS) {
+            for (i in bottom until bottom + count) {
                 val v = frameU16[i].toInt() and 0xFFFF
                 if (v < mn) mn = v
                 if (v > mx) mx = v
             }
-            // plausible temps (-40..500 °C => ~14900..49500 in K*64), non-flat field
             if (mn in 14000..50000 && mx in 14000..50000 && mx > mn + 16) {
-                if (!radiometricSeen) { radiometricSeen = true; dlog("K/64 radiometric in bottom half (min=$mn max=$mx)") }
-                renderK64(bottom, mn, mx)
+                if (!radiometricSeen) {
+                    radiometricSeen = true; dlog("K/64 radiometric in bottom half (min=$mn max=$mx)")
+                }
+                renderK64(bottom, mn, mx, w, minOf(rows, h - rows))
                 return
             }
         }
 
-        // 3) nothing recognized — show luma of the top block, log stats periodically
+        // 3) unknown — luma display + periodic stats
         if (frameCount % 150L == 1L) logFrameStats(w, h)
-        for (i in 0 until Xtherm.PIXELS) {
+        val rows = minOf(h, 192)
+        ensurePixels(w * rows)
+        for (i in 0 until w * rows) {
             val y = frameU16[i].toInt() and 0xFF
             pixels[i] = (0xFF shl 24) or (y shl 16) or (y shl 8) or y
         }
-        show("video ${w}x$h · frame $framesReceived · no thermal data recognized yet", "")
+        show("video t$curType ${w}x$h · frame $framesReceived · no thermal data recognized yet", "", w, rows)
+    }
+
+    private fun renderMjpegLuma(frame: ByteBuffer) {
+        val w = curW
+        val h = curH
+        val n = w * h
+        if (frame.remaining() < n) return
+        val bytes = ByteArray(n)
+        frame.get(bytes, 0, n)
+        ensurePixels(n)
+        for (i in 0 until n) {
+            val y = bytes[i].toInt() and 0xFF
+            pixels[i] = (0xFF shl 24) or (y shl 16) or (y shl 8) or y
+        }
+        show("MJPEG ${w}x$h · frame $framesReceived (video only — no radiometry in this mode)", "", w, h)
     }
 
     private fun renderXtherm(meta: Xtherm.Meta, imageOff: Int) {
@@ -396,36 +441,41 @@ class MainActivity : Activity() {
         val table = tempTable ?: return
         val minRaw = meta.minRaw
         val span = (meta.maxRaw - minRaw).coerceAtLeast(1)
+        ensurePixels(Xtherm.PIXELS)
         for (i in 0 until Xtherm.PIXELS) {
             val v = frameU16[imageOff + i].toInt() and 0xFFFF
             pixels[i] = palette[((v - minRaw) * 255 / span).coerceIn(0, 255)]
         }
-        drawMarker(meta.minX, meta.minY, 0xFF40A0FF.toInt())
-        drawMarker(meta.maxX, meta.maxY, 0xFFFF4040.toInt())
-        drawMarker(Xtherm.WIDTH / 2, Xtherm.HEIGHT / 2, 0xFFFFFFFF.toInt())
+        drawMarker(meta.minX, meta.minY, Xtherm.WIDTH, Xtherm.HEIGHT, 0xFF40A0FF.toInt())
+        drawMarker(meta.maxX, meta.maxY, Xtherm.WIDTH, Xtherm.HEIGHT, 0xFFFF4040.toInt())
+        drawMarker(Xtherm.WIDTH / 2, Xtherm.HEIGHT / 2, Xtherm.WIDTH, Xtherm.HEIGHT, 0xFFFFFFFF.toInt())
         show(
             "radiometric (xtherm) · frame %d · shutter %.1f°C".format(framesReceived, meta.tempShutter),
-            "▼%s  ⌖%s  ▲%s".format(fmt(table[meta.minRaw]), fmt(table[meta.centerRaw]), fmt(table[meta.maxRaw]))
+            "▼%s  ⌖%s  ▲%s".format(fmt(table[meta.minRaw]), fmt(table[meta.centerRaw]), fmt(table[meta.maxRaw])),
+            Xtherm.WIDTH, Xtherm.HEIGHT
         )
     }
 
-    private fun renderK64(offset: Int, mn: Int, mx: Int) {
+    private fun renderK64(offset: Int, mn: Int, mx: Int, w: Int, rows: Int) {
         val span = (mx - mn).coerceAtLeast(1)
+        val n = w * rows
         var minI = 0; var maxI = 0
-        for (i in 0 until Xtherm.PIXELS) {
+        ensurePixels(n)
+        for (i in 0 until n) {
             val v = frameU16[offset + i].toInt() and 0xFFFF
             if (v == mn) minI = i
             if (v == mx) maxI = i
             pixels[i] = palette[((v - mn) * 255 / span).coerceIn(0, 255)]
         }
-        val center = frameU16[offset + (Xtherm.HEIGHT / 2) * Xtherm.WIDTH + Xtherm.WIDTH / 2].toInt() and 0xFFFF
-        drawMarker(minI % Xtherm.WIDTH, minI / Xtherm.WIDTH, 0xFF40A0FF.toInt())
-        drawMarker(maxI % Xtherm.WIDTH, maxI / Xtherm.WIDTH, 0xFFFF4040.toInt())
-        drawMarker(Xtherm.WIDTH / 2, Xtherm.HEIGHT / 2, 0xFFFFFFFF.toInt())
+        val center = frameU16[offset + (rows / 2) * w + w / 2].toInt() and 0xFFFF
+        drawMarker(minI % w, minI / w, w, rows, 0xFF40A0FF.toInt())
+        drawMarker(maxI % w, maxI / w, w, rows, 0xFFFF4040.toInt())
+        drawMarker(w / 2, rows / 2, w, rows, 0xFFFFFFFF.toInt())
         fun k64(v: Int) = (v / 64.0 - 273.15).toFloat()
         show(
             "radiometric (K/64) · frame $framesReceived",
-            "▼%s  ⌖%s  ▲%s".format(fmt(k64(mn)), fmt(k64(center)), fmt(k64(mx)))
+            "▼%s  ⌖%s  ▲%s".format(fmt(k64(mn)), fmt(k64(center)), fmt(k64(mx))),
+            w, rows
         )
     }
 
@@ -446,9 +496,12 @@ class MainActivity : Activity() {
                 (if (h >= 384) " | " + stats(h / 2, minOf(192, h - h / 2)) else ""))
     }
 
-    private fun show(statusMsg: String, temps: String) {
+    private fun show(statusMsg: String, temps: String, w: Int, h: Int) {
         runOnUiThread {
-            bitmap.setPixels(pixels, 0, Xtherm.WIDTH, 0, 0, Xtherm.WIDTH, Xtherm.HEIGHT)
+            if (bitmap.width != w || bitmap.height != h) {
+                bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            }
+            bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
             thermalView.setImageBitmap(bitmap)
             thermalView.invalidate()
             tempText.text = temps
@@ -460,12 +513,12 @@ class MainActivity : Activity() {
         if (fahrenheit) "%.1f°F".format(celsius * 9f / 5f + 32f)
         else "%.1f°C".format(celsius)
 
-    private fun drawMarker(x: Int, y: Int, color: Int) {
+    private fun drawMarker(x: Int, y: Int, w: Int, h: Int, color: Int) {
         for (d in -3..3) {
-            val px = (x + d).coerceIn(0, Xtherm.WIDTH - 1)
-            val py = (y + d).coerceIn(0, Xtherm.HEIGHT - 1)
-            pixels[y.coerceIn(0, Xtherm.HEIGHT - 1) * Xtherm.WIDTH + px] = color
-            pixels[py * Xtherm.WIDTH + x.coerceIn(0, Xtherm.WIDTH - 1)] = color
+            val px = (x + d).coerceIn(0, w - 1)
+            val py = (y + d).coerceIn(0, h - 1)
+            pixels[y.coerceIn(0, h - 1) * w + px] = color
+            pixels[py * w + x.coerceIn(0, w - 1)] = color
         }
     }
 
