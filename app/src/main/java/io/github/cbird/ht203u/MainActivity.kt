@@ -65,6 +65,7 @@ class MainActivity : Activity() {
 
     @Volatile private var fahrenheit = false
     @Volatile private var streaming = false
+    @Volatile private var dumpRequested = false
     @Volatile private var framesReceived = 0L
     @Volatile private var lastFrameBytes = 0
     private var receiversRegistered = false
@@ -97,11 +98,9 @@ class MainActivity : Activity() {
         tempText = findViewById(R.id.tempText)
         btnUnit = findViewById(R.id.btnUnit)
 
-        findViewById<Button>(R.id.btnCalibrate).setOnClickListener {
-            dlog("calibrate: not supported over HIKMICRO UVC (no-op)")
-        }
+        findViewById<Button>(R.id.btnCalibrate).setOnClickListener { xuProbe() }
         findViewById<Button>(R.id.btnRange).setOnClickListener {
-            dlog("range switch: not supported over HIKMICRO UVC (no-op)")
+            dumpRequested = true
         }
         findViewById<Button>(R.id.btnLog).setOnClickListener { showLog() }
         btnUnit.setOnClickListener {
@@ -268,6 +267,32 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Read-only walk of the HIKMICRO vendor extension unit (id 10, VC interface 0). */
+    private fun xuProbe() {
+        val conn = usbConn ?: run { status("No device connected"); return }
+        status("Probing XU controls…")
+        Thread {
+            dlog("XU probe: unit=10 vcIf=0")
+            for (sel in 1..15) {
+                val info = ByteArray(1)
+                val ri = conn.controlTransfer(0xA1, 0x86, sel shl 8, (10 shl 8), info, 1, 300)
+                val lenBuf = ByteArray(2)
+                val rl = conn.controlTransfer(0xA1, 0x85, sel shl 8, (10 shl 8), lenBuf, 2, 300)
+                val len = if (rl >= 2)
+                    (lenBuf[0].toInt() and 0xFF) or ((lenBuf[1].toInt() and 0xFF) shl 8) else 0
+                var curHex = ""
+                if (len in 1..64) {
+                    val cur = ByteArray(len)
+                    val rc = conn.controlTransfer(0xA1, 0x81, sel shl 8, (10 shl 8), cur, len, 300)
+                    curHex = if (rc > 0) cur.take(rc).joinToString("") { "%02x".format(it) } else "err$rc"
+                }
+                dlog("XU sel=%d info=%s len=%d cur=%s".format(
+                    sel, if (ri > 0) "%02x".format(info[0]) else "err$ri", len, curHex))
+            }
+            status("XU probe done — tap Log and share")
+        }.start()
+    }
+
     private fun stopAll() {
         streaming = false
         bulk?.close()
@@ -353,7 +378,44 @@ class MainActivity : Activity() {
             }
         }
 
-        // 2) Stacked frame: bottom half raw Kelvin*64 (TC001/HIKMICRO style)
+        // 2) HIKMICRO stacked layout: one block is the rendered YUY2 image
+        // (chroma byte pinned to 0x80), the other is raw thermal counts.
+        if (w == 256 && h >= 384) {
+            fun chromaFrac(rowStart: Int): Double {
+                var hit = 0; var total = 0
+                var i = w * rowStart
+                val end = i + Xtherm.PIXELS
+                while (i < end) {
+                    if (((frameU16[i].toInt() shr 8) and 0xFF) == 0x80) hit++
+                    total++; i += 101
+                }
+                return hit.toDouble() / total
+            }
+            val f0 = chromaFrac(0)
+            val f1 = chromaFrac(196)
+            val rawRow = when {
+                f0 < 0.2 && f1 > 0.8 -> 0
+                f1 < 0.2 && f0 > 0.8 -> 196
+                else -> -1
+            }
+            if (rawRow >= 0) {
+                if (!radiometricSeen) {
+                    radiometricSeen = true
+                    dlog("HIK layout: raw block at row $rawRow (chroma frac row0=%.2f row196=%.2f)".format(f0, f1))
+                    dumpMetaRows(w, h)
+                }
+                if (dumpRequested) {
+                    dumpRequested = false
+                    logFrameStats(w, h)
+                    dumpMetaRows(w, h)
+                    status("meta rows dumped — tap Log")
+                }
+                renderHikRaw(w * rawRow)
+                return
+            }
+        }
+
+        // 3) Stacked frame: bottom half raw Kelvin*64 (TC001 style)
         if (h >= 2 * 190) {
             val rows = h / 2
             val bottom = w * rows
@@ -404,6 +466,44 @@ class MainActivity : Activity() {
             "▼%s  ⌖%s  ▲%s".format(fmt(table[meta.minRaw]), fmt(table[meta.centerRaw]), fmt(table[meta.maxRaw])),
             Xtherm.WIDTH, Xtherm.HEIGHT
         )
+    }
+
+    private fun renderHikRaw(offset: Int) {
+        val w = Xtherm.WIDTH
+        val rows = Xtherm.HEIGHT
+        var mn = 65535; var mx = 0; var minI = 0; var maxI = 0
+        for (i in 0 until w * rows) {
+            val v = frameU16[offset + i].toInt() and 0xFFFF
+            if (v < mn) { mn = v; minI = i }
+            if (v > mx) { mx = v; maxI = i }
+        }
+        val span = (mx - mn).coerceAtLeast(1)
+        ensurePixels(w * rows)
+        for (i in 0 until w * rows) {
+            val v = frameU16[offset + i].toInt() and 0xFFFF
+            pixels[i] = palette[((v - mn) * 255 / span).coerceIn(0, 255)]
+        }
+        val center = frameU16[offset + (rows / 2) * w + w / 2].toInt() and 0xFFFF
+        drawMarker(minI % w, minI / w, w, rows, 0xFF40A0FF.toInt())
+        drawMarker(maxI % w, maxI / w, w, rows, 0xFFFF4040.toInt())
+        drawMarker(w / 2, rows / 2, w, rows, 0xFFFFFFFF.toInt())
+        show(
+            "raw thermal (HIK) · frame $framesReceived · scale not yet calibrated",
+            "▼$mn  ⌖$center  ▲$mx (raw counts)",
+            w, rows
+        )
+    }
+
+    private fun dumpMetaRows(w: Int, h: Int) {
+        for (row in intArrayOf(192, 193, 194, 195, 388, 389, 390, 391)) {
+            if (row >= h) continue
+            val off = row * w
+            if (off + 32 > frameU16.size) continue
+            val hex = (0 until 32).joinToString(" ") {
+                "%04x".format(frameU16[off + it].toInt() and 0xFFFF)
+            }
+            dlog("row $row: $hex")
+        }
     }
 
     private fun renderK64(offset: Int, mn: Int, mx: Int, w: Int, rows: Int) {

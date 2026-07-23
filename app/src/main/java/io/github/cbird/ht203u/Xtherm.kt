@@ -95,6 +95,10 @@ object Xtherm {
         val tempShutter = u16(frame, m + AMOUNT_PIXELS + 1) / 10.0 - ZEROC
         val tempCore = u16(frame, m + AMOUNT_PIXELS + 2) / 10.0 - ZEROC
 
+        // plausibility: reject junk that happens to pass the geometric checks
+        if (maxRaw < 100 || maxRaw - minRaw < 16) return null
+        if (tempShutter !in -40.0..150.0 || tempFpa !in -40.0..150.0) return null
+
         val userArea = m + AMOUNT_PIXELS + 127
         return Meta(
             fpaAverage = u16(frame, m),

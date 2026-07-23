@@ -2,9 +2,9 @@
 <resources>
     <string name="app_name">HT203U Thermal</string>
     <string name="waiting">Plug in the camera…</string>
-    <string name="calibrate">Calibrate</string>
-    <string name="range_normal">Range: −20–120°C</string>
-    <string name="range_high">Range: −20–450°C</string>
+    <string name="calibrate">Probe XU</string>
+    <string name="range_normal">Dump meta</string>
+    <string name="range_high">Dump meta</string>
     <string name="unit_c">°C</string>
     <string name="unit_f">°F</string>
     <string name="log">Log</string>
