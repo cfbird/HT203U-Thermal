@@ -25,6 +25,17 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQ_CAMERA = 1
+        private const val TAG = "ht203u"
+    }
+
+    private val traceBuf = ArrayDeque<String>()
+
+    private fun dlog(m: String) {
+        android.util.Log.i(TAG, m)
+        synchronized(traceBuf) {
+            traceBuf.addLast(m)
+            while (traceBuf.size > 200) traceBuf.removeFirst()
+        }
     }
 
     private var cameraHelper: ICameraHelper? = null
@@ -74,7 +85,7 @@ class MainActivity : Activity() {
                     }
                 } else {
                     statusText.text =
-                        "Stream started but no frames arriving (last buffer: $lastFrameBytes B) — try replugging"
+                        "Stream started but no frames arriving (last buffer: $lastFrameBytes B) — tap Log and share it"
                 }
             }
             mainHandler.postDelayed(this, 3000)
@@ -108,6 +119,7 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.btnCalibrate).setOnClickListener {
             cameraHelper?.getUVCControl()?.setZoomAbsolute(Xtherm.CMD_CALIBRATE)
         }
+        findViewById<Button>(R.id.btnLog).setOnClickListener { showLog() }
         btnRange.setOnClickListener {
             highRange = !highRange
             cameraHelper?.getUVCControl()?.setZoomAbsolute(
@@ -165,6 +177,8 @@ class MainActivity : Activity() {
 
     private val stateCallback = object : ICameraHelper.StateCallback {
         override fun onAttach(device: UsbDevice) {
+            dlog("onAttach vid=%04x pid=%04x name=%s".format(
+                device.vendorId, device.productId, device.productName))
             if (requestingDevice) return
             requestingDevice = true
             status("Camera attached — requesting permission…")
@@ -182,14 +196,26 @@ class MainActivity : Activity() {
 
         override fun onCameraOpen(device: UsbDevice) {
             val helper = cameraHelper ?: return
-            val size = pickThermalSize(helper.supportedSizeList)
+            val sizes = helper.supportedSizeList
+            dlog("onCameraOpen; supported sizes: " + sizes.joinToString {
+                "type=${it.type} ${it.width}x${it.height}@${it.fps}(${it.fpsList})"
+            })
+            val size = pickThermalSize(sizes)
             if (size == null) {
-                status("No ${Xtherm.WIDTH}x${Xtherm.FRAME_HEIGHT} YUYV mode found — is this an HT-203U?")
+                status("No ${Xtherm.WIDTH}x${Xtherm.FRAME_HEIGHT} YUYV mode found — is this an HT-203U? (tap Log)")
                 return
             }
-            helper.previewSize = size
+            dlog("chosen size: type=${size.type} ${size.width}x${size.height}@${size.fps}")
+            try {
+                helper.previewSize = size
+            } catch (t: Throwable) {
+                dlog("setPreviewSize failed: $t")
+                status("setPreviewSize failed: ${t.message} (tap Log)")
+                return
+            }
             helper.setFrameCallback(frameCallback, UVCCamera.PIXEL_FORMAT_RAW)
             attachSinkIfReady()
+            dlog("startPreview()")
             helper.startPreview()
             status("Streaming ${size.width}x${size.height} — switching to raw mode…")
             rawModeRequested = false
@@ -252,7 +278,14 @@ class MainActivity : Activity() {
 
     private fun enterRawMode() {
         val control = cameraHelper?.getUVCControl() ?: return
+        try {
+            val limits = control.updateZoomAbsoluteLimit()
+            dlog("zoom limits: ${limits?.joinToString()}; sending 0x8004")
+        } catch (t: Throwable) {
+            dlog("zoom limit query failed: $t")
+        }
         control.setZoomAbsolute(Xtherm.CMD_RAW_MODE)
+        dlog("readback zoom=0x%x".format(runCatching { control.zoomAbsolute }.getOrDefault(-1)))
         rawModeRequested = true
         // Shutter calibration shortly after entering raw mode
         mainHandler.postDelayed({
@@ -277,6 +310,7 @@ class MainActivity : Activity() {
 
     private fun processFrame(frame: ByteBuffer) {
         lastFrameBytes = frame.remaining()
+        if (framesReceived == 0L) dlog("first frame callback: ${frame.remaining()} B")
         if (frame.remaining() < Xtherm.FRAME_U16 * 2) return
         framesReceived++
         frame.order(ByteOrder.LITTLE_ENDIAN)
@@ -354,5 +388,41 @@ class MainActivity : Activity() {
 
     private fun status(msg: String) {
         runOnUiThread { statusText.text = msg }
+    }
+
+    private fun showLog() {
+        val sb = StringBuilder()
+        sb.append("=== app trace ===\n")
+        synchronized(traceBuf) { traceBuf.forEach { sb.append(it).append('\n') } }
+        sb.append("\n=== logcat (native/UVC) ===\n")
+        try {
+            val proc = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-t", "400"))
+            val keys = listOf("UVC", "uvc", "libusb", "usb", "Camera", TAG, "AndroidRuntime", "libjpeg")
+            proc.inputStream.bufferedReader().readLines()
+                .filter { line -> keys.any { line.contains(it) } }
+                .takeLast(150)
+                .forEach { sb.append(it).append('\n') }
+        } catch (t: Throwable) {
+            sb.append("logcat read failed: $t\n")
+        }
+        val text = sb.toString()
+        runOnUiThread {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("Debug log")
+                .setMessage(text)
+                .setPositiveButton("Share") { _, _ ->
+                    val i = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(android.content.Intent.EXTRA_TEXT, text)
+                    }
+                    startActivity(android.content.Intent.createChooser(i, "Share log"))
+                }
+                .setNeutralButton("Copy") { _, _ ->
+                    val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("ht203u log", text))
+                }
+                .setNegativeButton("Close", null)
+                .show()
+        }
     }
 }
