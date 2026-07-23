@@ -30,6 +30,5 @@ android {
 }
 
 dependencies {
-    implementation("com.herohan:UVCAndroid:1.0.12")
     testImplementation("junit:junit:4.13.2")
 }

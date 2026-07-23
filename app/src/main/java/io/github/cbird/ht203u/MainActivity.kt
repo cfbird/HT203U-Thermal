@@ -2,23 +2,24 @@ package io.github.cbird.ht203u
 
 import android.Manifest
 import android.app.Activity
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.SurfaceTexture
 import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.view.TextureView
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.ImageView
 import android.widget.TextView
-import com.herohan.uvcapp.CameraHelper
-import com.herohan.uvcapp.ICameraHelper
-import com.serenegiant.usb.Size
-import com.serenegiant.usb.UVCCamera
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -27,6 +28,7 @@ class MainActivity : Activity() {
     companion object {
         private const val REQ_CAMERA = 1
         private const val TAG = "ht203u"
+        private const val ACTION_USB_PERMISSION = "io.github.cbird.ht203u.USB_PERMISSION"
     }
 
     private val traceBuf = ArrayDeque<String>()
@@ -39,83 +41,49 @@ class MainActivity : Activity() {
         }
     }
 
-    private var cameraHelper: ICameraHelper? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val usbManager by lazy { getSystemService(Context.USB_SERVICE) as UsbManager }
 
     private lateinit var thermalView: ImageView
     private lateinit var statusText: TextView
     private lateinit var tempText: TextView
-    private lateinit var btnRange: Button
     private lateinit var btnUnit: Button
-    private lateinit var sinkView: TextureView
-    @Volatile private var sinkTexture: SurfaceTexture? = null
-    @Volatile private var sinkAttached = false
 
     private var bitmap: Bitmap = Bitmap.createBitmap(Xtherm.WIDTH, Xtherm.HEIGHT, Bitmap.Config.ARGB_8888)
     private var pixels = IntArray(Xtherm.PIXELS)
     private val palette = Xtherm.ironPalette()
     private var frameU16 = ShortArray(256 * 520)
 
-    // Mode negotiation fallback
-    private var candidates: List<Size> = emptyList()
-    private var candIdx = 0
+    private var usbConn: UsbDeviceConnection? = null
+    private var bulk: BulkUvc? = null
+    private var usbDevice: UsbDevice? = null
+    private var modes: List<BulkUvc.FrameDesc> = emptyList()
+    private var modeIdx = 0
     @Volatile private var curW = Xtherm.WIDTH
     @Volatile private var curH = Xtherm.FRAME_HEIGHT
-    @Volatile private var curType = UVCCamera.UVC_VS_FRAME_UNCOMPRESSED
     @Volatile private var radiometricSeen = false
 
-    @Volatile private var highRange = false
     @Volatile private var fahrenheit = false
-    @Volatile private var rawModeRequested = false
+    @Volatile private var streaming = false
     @Volatile private var framesReceived = 0L
     @Volatile private var lastFrameBytes = 0
-    @Volatile private var permissionRetried = false
-    @Volatile private var requestingDevice = false
+    private var receiversRegistered = false
 
     private var tempTable: FloatArray? = null
     private var frameCount = 0L
 
     private val watchdog = object : Runnable {
         override fun run() {
-            val helper = cameraHelper
-            if (helper != null && rawModeRequested && helper.isCameraOpened) {
-                if (framesReceived == 0L) {
-                    if (candIdx + 1 < candidates.size) {
-                        candIdx++
-                        applySize(candidates[candIdx], "no frames in previous mode")
-                    } else {
-                        statusText.text =
-                            "No mode delivered frames (last buffer: $lastFrameBytes B) — tap Log and share it"
-                    }
+            if (streaming && framesReceived == 0L) {
+                if (modeIdx + 1 < modes.size) {
+                    modeIdx++
+                    startMode("no frames in previous mode")
+                } else {
+                    statusText.text =
+                        "No mode delivered frames (last buffer: $lastFrameBytes B) — tap Log and share it"
                 }
             }
-            mainHandler.postDelayed(this, 3000)
-        }
-    }
-
-    private fun applySize(size: Size, reason: String) {
-        val helper = cameraHelper ?: return
-        dlog("applySize type=${size.type} ${size.width}x${size.height}@${size.fps} ($reason)")
-        statusText.text = "Trying mode ${size.width}x${size.height} (type ${size.type})…"
-        try {
-            helper.stopPreview()
-            helper.previewSize = size
-            curW = size.width
-            curH = size.height
-            curType = size.type
-            framesReceived = 0
-            frameCount = 0
-            tempTable = null
-            // MJPEG frames are decoded to NV21 by the lib; uncompressed passes through raw
-            helper.setFrameCallback(
-                frameCallback,
-                if (size.type == UVCCamera.UVC_VS_FRAME_MJPEG) UVCCamera.PIXEL_FORMAT_NV21
-                else UVCCamera.PIXEL_FORMAT_RAW
-            )
-            helper.startPreview()
-        } catch (t: Throwable) {
-            dlog("applySize failed: $t")
-            statusText.text = "Mode switch failed: ${t.message}"
+            mainHandler.postDelayed(this, 3500)
         }
     }
 
@@ -127,37 +95,20 @@ class MainActivity : Activity() {
         thermalView = findViewById(R.id.thermalView)
         statusText = findViewById(R.id.statusText)
         tempText = findViewById(R.id.tempText)
-        btnRange = findViewById(R.id.btnRange)
         btnUnit = findViewById(R.id.btnUnit)
 
         findViewById<Button>(R.id.btnCalibrate).setOnClickListener {
-            cameraHelper?.getUVCControl()?.setZoomAbsolute(Xtherm.CMD_CALIBRATE)
+            dlog("calibrate: not supported over HIKMICRO UVC (no-op)")
+        }
+        findViewById<Button>(R.id.btnRange).setOnClickListener {
+            dlog("range switch: not supported over HIKMICRO UVC (no-op)")
         }
         findViewById<Button>(R.id.btnLog).setOnClickListener { showLog() }
-        btnRange.setOnClickListener {
-            highRange = !highRange
-            cameraHelper?.getUVCControl()?.setZoomAbsolute(
-                if (highRange) Xtherm.CMD_RANGE_HIGH else Xtherm.CMD_RANGE_NORMAL
-            )
-            btnRange.setText(if (highRange) R.string.range_high else R.string.range_normal)
-        }
         btnUnit.setOnClickListener {
             fahrenheit = !fahrenheit
             btnUnit.setText(if (fahrenheit) R.string.unit_f else R.string.unit_c)
         }
-        statusText.setOnClickListener { retryDevice() }
-        sinkView = findViewById(R.id.sinkView)
-        sinkView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
-                sinkTexture = st
-                attachSinkIfReady()
-            }
-            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
-            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
-                sinkTexture = null; sinkAttached = false; return true
-            }
-            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
-        }
+        statusText.setOnClickListener { scanForDevice() }
     }
 
     private fun hasCameraPermission(): Boolean =
@@ -165,13 +116,14 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        registerReceivers()
         if (!hasCameraPermission()) {
             status("Camera permission needed (Android requires it for USB cameras)…")
             requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
         } else {
-            initCameraHelper()
+            scanForDevice()
         }
-        mainHandler.postDelayed(watchdog, 3000)
+        mainHandler.postDelayed(watchdog, 3500)
     }
 
     override fun onRequestPermissionsResult(
@@ -180,8 +132,7 @@ class MainActivity : Activity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQ_CAMERA) {
             if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                status(getString(R.string.waiting))
-                initCameraHelper()
+                scanForDevice()
             } else {
                 status("Camera permission denied — USB cameras can't work without it. Grant it in App info → Permissions.")
             }
@@ -191,157 +142,146 @@ class MainActivity : Activity() {
     override fun onStop() {
         super.onStop()
         mainHandler.removeCallbacks(watchdog)
-        cameraHelper?.release()
-        cameraHelper = null
-        sinkAttached = false
-    }
-
-    private fun initCameraHelper() {
-        if (cameraHelper != null) return
-        cameraHelper = CameraHelper().apply {
-            setStateCallback(stateCallback)
+        stopAll()
+        if (receiversRegistered) {
+            unregisterReceiver(usbReceiver)
+            receiversRegistered = false
         }
     }
 
-    private val stateCallback = object : ICameraHelper.StateCallback {
-        override fun onAttach(device: UsbDevice) {
-            dlog("onAttach vid=%04x pid=%04x name=%s".format(
-                device.vendorId, device.productId, device.productName))
-            if (requestingDevice) return
-            requestingDevice = true
-            status("Camera attached — requesting permission…")
-            cameraHelper?.selectDevice(device)
+    private fun registerReceivers() {
+        if (receiversRegistered) return
+        val filter = IntentFilter().apply {
+            addAction(ACTION_USB_PERMISSION)
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
         }
-
-        override fun onDeviceOpen(device: UsbDevice, isFirstOpen: Boolean) {
-            requestingDevice = false
-            dumpDescriptors(device)
-            val param = com.serenegiant.usb.UVCParam()
-            param.quirks = UVCCamera.UVC_QUIRK_FIX_BANDWIDTH
-            cameraHelper?.openCamera(param)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(usbReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(usbReceiver, filter)
         }
+        receiversRegistered = true
+    }
 
-        override fun onCameraOpen(device: UsbDevice) {
-            val helper = cameraHelper ?: return
-            val sizes = helper.supportedSizeList
-            dlog("onCameraOpen; supported sizes: " + sizes.joinToString {
-                "type=${it.type} ${it.width}x${it.height}@${it.fps}"
-            })
-            // Uncompressed thermal modes first (any width), then MJPEG as video fallback
-            val uncompPrio = mapOf(392 to 0, 196 to 1, 400 to 2, 200 to 3, 192 to 4)
-            val uncomp = sizes
-                .filter { it.type == UVCCamera.UVC_VS_FRAME_UNCOMPRESSED }
-                .sortedBy { (if (it.width == 256) 0 else 10) + (uncompPrio[it.height] ?: 9) }
-                .distinctBy { it.width to it.height }
-            val mjpegPrio = mapOf(320 to 0, 160 to 1, 360 to 2)
-            val mjpeg = sizes
-                .filter { it.type == UVCCamera.UVC_VS_FRAME_MJPEG }
-                .sortedBy { mjpegPrio[it.height] ?: 9 }
-                .distinctBy { it.width to it.height }
-            candidates = uncomp + mjpeg
-            if (candidates.isEmpty()) {
-                status("No video modes found at all — tap Log")
-                return
-            }
-            dlog("candidates: " + candidates.joinToString { "t${it.type} ${it.width}x${it.height}" })
-            candIdx = 0
-            radiometricSeen = false
-            attachSinkIfReady()
-            applySize(candidates[0], "initial")
-            rawModeRequested = true
-            mainHandler.postDelayed({ enterRawMode() }, 700)
-        }
-
-        override fun onCameraClose(device: UsbDevice) {
-            sinkAttached = false
-            status("Camera closed")
-        }
-
-        override fun onDeviceClose(device: UsbDevice) {}
-
-        override fun onDetach(device: UsbDevice) {
-            requestingDevice = false
-            permissionRetried = false
-            status(getString(R.string.waiting))
-            runOnUiThread { tempText.text = "" }
-        }
-
-        override fun onCancel(device: UsbDevice) {
-            requestingDevice = false
-            if (!permissionRetried) {
-                permissionRetried = true
-                status("USB permission denied — retrying in 2s…")
-                mainHandler.postDelayed({ retryDevice() }, 2000)
-            } else {
-                status("USB permission denied — tap this text to retry, or replug the camera")
+    private val usbReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                ACTION_USB_PERMISSION -> {
+                    val device: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                    val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    dlog("usb permission result: granted=$granted dev=${device?.productName}")
+                    if (granted && device != null) {
+                        openAndStart(device)
+                    } else {
+                        status("USB permission denied — tap this text to retry, or replug the camera")
+                    }
+                }
+                UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                    dlog("device attached")
+                    if (hasCameraPermission()) scanForDevice()
+                }
+                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    dlog("device detached")
+                    stopAll()
+                    status(getString(R.string.waiting))
+                    runOnUiThread { tempText.text = "" }
+                }
             }
         }
     }
 
-    private fun dumpDescriptors(device: UsbDevice) {
-        try {
-            val um = getSystemService(USB_SERVICE) as UsbManager
-            val conn = um.openDevice(device)
-            if (conn == null) {
-                dlog("descriptor dump: openDevice returned null")
-                return
-            }
-            val raw = conn.rawDescriptors
-            conn.close()
-            if (raw != null) dlog(UsbDesc.summarize(raw)) else dlog("descriptor dump: null")
-        } catch (t: Throwable) {
-            dlog("descriptor dump failed: $t")
+    private fun hasVideoInterface(device: UsbDevice): Boolean {
+        for (i in 0 until device.interfaceCount) {
+            if (device.getInterface(i).interfaceClass == 14) return true
         }
+        return false
     }
 
-    private fun retryDevice() {
+    private fun scanForDevice() {
         if (!hasCameraPermission()) {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
             return
         }
-        if (cameraHelper == null) initCameraHelper()
-        val helper = cameraHelper ?: return
-        val device = helper.deviceList?.firstOrNull()
+        val device = usbManager.deviceList.values.firstOrNull { hasVideoInterface(it) }
         if (device == null) {
-            status("No USB camera found — check GrapheneOS Settings → USB peripherals, then replug")
+            status("No USB camera found — check GrapheneOS USB peripheral settings, then replug")
             return
         }
-        requestingDevice = true
-        status("Requesting USB permission…")
-        helper.selectDevice(device)
-    }
-
-    private fun attachSinkIfReady() {
-        val helper = cameraHelper ?: return
-        val st = sinkTexture ?: return
-        if (!sinkAttached && helper.isCameraOpened) {
-            st.setDefaultBufferSize(Xtherm.WIDTH, Xtherm.FRAME_HEIGHT)
-            helper.addSurface(st, false)
-            sinkAttached = true
+        dlog("found device vid=%04x pid=%04x name=%s".format(
+            device.vendorId, device.productId, device.productName))
+        if (usbManager.hasPermission(device)) {
+            openAndStart(device)
+        } else {
+            status("Requesting USB permission…")
+            val pi = PendingIntent.getBroadcast(
+                this, 0,
+                Intent(ACTION_USB_PERMISSION).setPackage(packageName),
+                PendingIntent.FLAG_MUTABLE
+            )
+            usbManager.requestPermission(device, pi)
         }
     }
 
-    private fun enterRawMode() {
-        val control = cameraHelper?.getUVCControl() ?: return
-        try {
-            val limits = control.updateZoomAbsoluteLimit()
-            dlog("zoom limits: ${limits?.joinToString()}; sending 0x8004")
-        } catch (t: Throwable) {
-            dlog("zoom limit query failed: $t")
+    private fun openAndStart(device: UsbDevice) {
+        stopAll()
+        val conn = usbManager.openDevice(device)
+        if (conn == null) {
+            status("openDevice failed — replug and retry")
+            dlog("openDevice returned null")
+            return
         }
-        control.setZoomAbsolute(Xtherm.CMD_RAW_MODE)
-        dlog("readback zoom=0x%x".format(runCatching { control.zoomAbsolute }.getOrDefault(-1)))
-        mainHandler.postDelayed({
-            cameraHelper?.getUVCControl()?.setZoomAbsolute(Xtherm.CMD_CALIBRATE)
-        }, 400)
+        usbDevice = device
+        usbConn = conn
+        conn.rawDescriptors?.let { dlog(UsbDesc.summarize(it)) }
+
+        val uvc = BulkUvc(device, conn, ::onBulkFrame, ::dlog)
+        bulk = uvc
+        val all = uvc.parseDescriptors()
+        if (all.isEmpty()) {
+            status("No uncompressed frame descriptors found — tap Log")
+            return
+        }
+        // Preference: stacked 256x392 first (image+thermal), then the rest
+        val prio = mapOf(392 to 0, 196 to 1, 400 to 2, 200 to 3, 192 to 4)
+        modes = all.sortedBy { (if (it.width == 256) 0 else 10) + (prio[it.height] ?: 9) }
+        dlog("mode order: " + modes.joinToString { "${it.width}x${it.height}" })
+        modeIdx = 0
+        radiometricSeen = false
+        streaming = true
+        startMode("initial")
     }
 
-    private val frameCallback = com.serenegiant.usb.IFrameCallback { frame: ByteBuffer ->
+    private fun startMode(reason: String) {
+        val uvc = bulk ?: return
+        val fd = modes.getOrNull(modeIdx) ?: return
+        dlog("startMode ${fd.width}x${fd.height} ($reason)")
+        status("Trying mode ${fd.width}x${fd.height}…")
+        curW = fd.width
+        curH = fd.height
+        framesReceived = 0
+        frameCount = 0
+        tempTable = null
+        if (!uvc.start(fd)) {
+            status("Mode ${fd.width}x${fd.height} failed to start — tap Log")
+        }
+    }
+
+    private fun stopAll() {
+        streaming = false
+        bulk?.close()
+        bulk = null
+        usbConn?.close()
+        usbConn = null
+        usbDevice = null
+    }
+
+    private fun onBulkFrame(frame: ByteBuffer) {
         try {
             processFrame(frame)
         } catch (t: Throwable) {
             dlog("frame error: $t")
-            status("Frame error: ${t.message}")
         }
     }
 
@@ -352,15 +292,10 @@ class MainActivity : Activity() {
     private fun processFrame(frame: ByteBuffer) {
         lastFrameBytes = frame.remaining()
         if (framesReceived == 0L) {
-            dlog("first frame: ${frame.remaining()} B in mode t$curType ${curW}x${curH}")
+            dlog("first frame: ${frame.remaining()} B in mode ${curW}x${curH}")
         }
         framesReceived++
         frameCount++
-
-        if (curType == UVCCamera.UVC_VS_FRAME_MJPEG) {
-            renderMjpegLuma(frame)
-            return
-        }
 
         val nU16 = frame.remaining() / 2
         if (nU16 < curW * 100) return
@@ -416,27 +351,12 @@ class MainActivity : Activity() {
             val y = frameU16[i].toInt() and 0xFF
             pixels[i] = (0xFF shl 24) or (y shl 16) or (y shl 8) or y
         }
-        show("video t$curType ${w}x$h · frame $framesReceived · no thermal data recognized yet", "", w, rows)
-    }
-
-    private fun renderMjpegLuma(frame: ByteBuffer) {
-        val w = curW
-        val h = curH
-        val n = w * h
-        if (frame.remaining() < n) return
-        val bytes = ByteArray(n)
-        frame.get(bytes, 0, n)
-        ensurePixels(n)
-        for (i in 0 until n) {
-            val y = bytes[i].toInt() and 0xFF
-            pixels[i] = (0xFF shl 24) or (y shl 16) or (y shl 8) or y
-        }
-        show("MJPEG ${w}x$h · frame $framesReceived (video only — no radiometry in this mode)", "", w, h)
+        show("video ${w}x$h · frame $framesReceived · no thermal data recognized yet", "", w, rows)
     }
 
     private fun renderXtherm(meta: Xtherm.Meta, imageOff: Int) {
         if (tempTable == null || frameCount % 8 == 0L) {
-            tempTable = Xtherm.tempTable(meta, highRange)
+            tempTable = Xtherm.tempTable(meta, false)
         }
         val table = tempTable ?: return
         val minRaw = meta.minRaw
@@ -530,13 +450,13 @@ class MainActivity : Activity() {
         val sb = StringBuilder()
         sb.append("=== app trace ===\n")
         synchronized(traceBuf) { traceBuf.forEach { sb.append(it).append('\n') } }
-        sb.append("\n=== logcat (native/UVC) ===\n")
+        sb.append("\n=== logcat ===\n")
         try {
             val proc = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-t", "400"))
-            val keys = listOf("UVC", "uvc", "libusb", "usb", "Camera", TAG, "AndroidRuntime", "libjpeg")
+            val keys = listOf("usb", "Usb", "USB", TAG, "AndroidRuntime", "bulkuvc")
             proc.inputStream.bufferedReader().readLines()
                 .filter { line -> keys.any { line.contains(it) } }
-                .takeLast(150)
+                .takeLast(120)
                 .forEach { sb.append(it).append('\n') }
         } catch (t: Throwable) {
             sb.append("logcat read failed: $t\n")
@@ -547,11 +467,11 @@ class MainActivity : Activity() {
                 .setTitle("Debug log")
                 .setMessage(text)
                 .setPositiveButton("Share") { _, _ ->
-                    val i = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                    val i = Intent(Intent.ACTION_SEND).apply {
                         type = "text/plain"
-                        putExtra(android.content.Intent.EXTRA_TEXT, text)
+                        putExtra(Intent.EXTRA_TEXT, text)
                     }
-                    startActivity(android.content.Intent.createChooser(i, "Share log"))
+                    startActivity(Intent.createChooser(i, "Share log"))
                 }
                 .setNeutralButton("Copy") { _, _ ->
                     val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
