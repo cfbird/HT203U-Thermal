@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- UVC cameras: Miscellaneous class with Interface Association Descriptor -->
+    <usb-device class="239" subclass="2" protocol="1" />
+    <!-- Some enumerate as Video class at device level -->
+    <usb-device class="14" />
+</resources>

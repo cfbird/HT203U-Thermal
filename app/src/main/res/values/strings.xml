@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HT203U Thermal</string>
+    <string name="waiting">Plug in the camera…</string>
+    <string name="calibrate">Calibrate</string>
+    <string name="range_normal">Range: −20–120°C</string>
+    <string name="range_high">Range: −20–450°C</string>
+    <string name="unit_c">°C</string>
+    <string name="unit_f">°F</string>
+</resources>
