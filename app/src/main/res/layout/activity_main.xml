@@ -59,6 +59,12 @@
             android:text="@string/unit_c" />
 
         <Button
+            android:id="@+id/btnRotate"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/rotate" />
+
+        <Button
             android:id="@+id/btnLog"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"

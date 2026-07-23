@@ -66,6 +66,9 @@ class MainActivity : Activity() {
     @Volatile private var fahrenheit = false
     @Volatile private var streaming = false
     @Volatile private var dumpRequested = false
+    @Volatile private var rotation = 0 // quarter turns clockwise
+    private var rotPixels = IntArray(0)
+    private var vcClaimed = false
     @Volatile private var framesReceived = 0L
     @Volatile private var lastFrameBytes = 0
     private var receiversRegistered = false
@@ -103,6 +106,11 @@ class MainActivity : Activity() {
             dumpRequested = true
         }
         findViewById<Button>(R.id.btnLog).setOnClickListener { showLog() }
+        rotation = getPreferences(MODE_PRIVATE).getInt("rotation", 1)
+        findViewById<Button>(R.id.btnRotate).setOnClickListener {
+            rotation = (rotation + 1) % 4
+            getPreferences(MODE_PRIVATE).edit().putInt("rotation", rotation).apply()
+        }
         btnUnit.setOnClickListener {
             fahrenheit = !fahrenheit
             btnUnit.setText(if (fahrenheit) R.string.unit_f else R.string.unit_c)
@@ -270,24 +278,42 @@ class MainActivity : Activity() {
     /** Read-only walk of the HIKMICRO vendor extension unit (id 10, VC interface 0). */
     private fun xuProbe() {
         val conn = usbConn ?: run { status("No device connected"); return }
+        val device = usbDevice ?: return
         status("Probing XU controls…")
         Thread {
+            // class requests to the VC interface require it to be claimed
+            if (!vcClaimed) {
+                for (k in 0 until device.interfaceCount) {
+                    val itf = device.getInterface(k)
+                    if (itf.interfaceClass == 14 && itf.interfaceSubclass == 1) {
+                        vcClaimed = conn.claimInterface(itf, true)
+                        dlog("claim VC interface #${itf.id} -> $vcClaimed")
+                        break
+                    }
+                }
+            }
             dlog("XU probe: unit=10 vcIf=0")
+            fun rd(req: Int, sel: Int, len: Int): Pair<Int, ByteArray> {
+                val buf = ByteArray(len)
+                val r = conn.controlTransfer(0xA1, req, sel shl 8, (10 shl 8), buf, len, 300)
+                return r to buf
+            }
             for (sel in 1..15) {
-                val info = ByteArray(1)
-                val ri = conn.controlTransfer(0xA1, 0x86, sel shl 8, (10 shl 8), info, 1, 300)
-                val lenBuf = ByteArray(2)
-                val rl = conn.controlTransfer(0xA1, 0x85, sel shl 8, (10 shl 8), lenBuf, 2, 300)
+                val (ri, info) = rd(0x86, sel, 1)
+                val (rl, lenBuf) = rd(0x85, sel, 2)
                 val len = if (rl >= 2)
                     (lenBuf[0].toInt() and 0xFF) or ((lenBuf[1].toInt() and 0xFF) shl 8) else 0
-                var curHex = ""
+                var curHex = ""; var minHex = ""; var maxHex = ""
                 if (len in 1..64) {
-                    val cur = ByteArray(len)
-                    val rc = conn.controlTransfer(0xA1, 0x81, sel shl 8, (10 shl 8), cur, len, 300)
+                    val (rc, cur) = rd(0x81, sel, len)
                     curHex = if (rc > 0) cur.take(rc).joinToString("") { "%02x".format(it) } else "err$rc"
+                    val (rmin, mn) = rd(0x82, sel, len)
+                    if (rmin > 0) minHex = mn.take(rmin).joinToString("") { "%02x".format(it) }
+                    val (rmax, mx) = rd(0x83, sel, len)
+                    if (rmax > 0) maxHex = mx.take(rmax).joinToString("") { "%02x".format(it) }
                 }
-                dlog("XU sel=%d info=%s len=%d cur=%s".format(
-                    sel, if (ri > 0) "%02x".format(info[0]) else "err$ri", len, curHex))
+                dlog("XU sel=%d info=%s len=%d cur=%s min=%s max=%s".format(
+                    sel, if (ri > 0) "%02x".format(info[0]) else "err$ri", len, curHex, minHex, maxHex))
             }
             status("XU probe done — tap Log and share")
         }.start()
@@ -547,11 +573,32 @@ class MainActivity : Activity() {
     }
 
     private fun show(statusMsg: String, temps: String, w: Int, h: Int) {
-        runOnUiThread {
-            if (bitmap.width != w || bitmap.height != h) {
-                bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        // apply rotation on the worker thread
+        val rot = rotation and 3
+        val dw: Int; val dh: Int; val src: IntArray
+        if (rot == 0) {
+            dw = w; dh = h; src = pixels
+        } else {
+            dw = if (rot == 2) w else h
+            dh = if (rot == 2) h else w
+            if (rotPixels.size < w * h) rotPixels = IntArray(w * h)
+            for (y in 0 until h) {
+                for (x in 0 until w) {
+                    val v = pixels[y * w + x]
+                    when (rot) {
+                        1 -> rotPixels[x * dw + (h - 1 - y)] = v           // 90 CW
+                        2 -> rotPixels[(h - 1 - y) * dw + (w - 1 - x)] = v // 180
+                        else -> rotPixels[(w - 1 - x) * dw + y] = v        // 270
+                    }
+                }
             }
-            bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
+            src = rotPixels
+        }
+        runOnUiThread {
+            if (bitmap.width != dw || bitmap.height != dh) {
+                bitmap = Bitmap.createBitmap(dw, dh, Bitmap.Config.ARGB_8888)
+            }
+            bitmap.setPixels(src, 0, dw, 0, 0, dw, dh)
             thermalView.setImageBitmap(bitmap)
             thermalView.invalidate()
             tempText.text = temps

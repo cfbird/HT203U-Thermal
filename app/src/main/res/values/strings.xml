@@ -8,4 +8,5 @@
     <string name="unit_c">°C</string>
     <string name="unit_f">°F</string>
     <string name="log">Log</string>
+    <string name="rotate">Rotate</string>
 </resources>
