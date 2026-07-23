@@ -1,6 +1,8 @@
 package io.github.cbird.ht203u
 
+import android.Manifest
 import android.app.Activity
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.hardware.usb.UsbDevice
 import android.os.Bundle
@@ -20,6 +22,10 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 class MainActivity : Activity() {
+
+    companion object {
+        private const val REQ_CAMERA = 1
+    }
 
     private var cameraHelper: ICameraHelper? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -115,10 +121,32 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun hasCameraPermission(): Boolean =
+        checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+
     override fun onStart() {
         super.onStart()
-        initCameraHelper()
+        if (!hasCameraPermission()) {
+            status("Camera permission needed (Android requires it for USB cameras)…")
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
+        } else {
+            initCameraHelper()
+        }
         mainHandler.postDelayed(watchdog, 3000)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_CAMERA) {
+            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                status(getString(R.string.waiting))
+                initCameraHelper()
+            } else {
+                status("Camera permission denied — USB cameras can't work without it. Grant it in App info → Permissions.")
+            }
+        }
     }
 
     override fun onStop() {
@@ -196,6 +224,11 @@ class MainActivity : Activity() {
     }
 
     private fun retryDevice() {
+        if (!hasCameraPermission()) {
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
+            return
+        }
+        if (cameraHelper == null) initCameraHelper()
         val helper = cameraHelper ?: return
         val device = helper.deviceList?.firstOrNull()
         if (device == null) {

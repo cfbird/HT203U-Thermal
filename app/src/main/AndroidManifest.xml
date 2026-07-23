@@ -5,6 +5,10 @@
         android:name="android.hardware.usb.host"
         android:required="true" />
 
+    <!-- Required since Android 10: UsbManager silently denies USB permission
+         for video-class devices unless the app holds CAMERA -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
     <application
         android:allowBackup="true"
         android:label="@string/app_name"
