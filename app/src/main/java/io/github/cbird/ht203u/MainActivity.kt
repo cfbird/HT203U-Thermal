@@ -49,6 +49,8 @@ class MainActivity : Activity() {
     private var frameCount = 0L
 
     private var previewRestarts = 0
+    @Volatile private var permissionRetried = false
+    @Volatile private var requestingDevice = false
 
     private val watchdog = object : Runnable {
         override fun run() {
@@ -83,6 +85,7 @@ class MainActivity : Activity() {
         tempText = findViewById(R.id.tempText)
         btnRange = findViewById(R.id.btnRange)
         btnUnit = findViewById(R.id.btnUnit)
+        statusText.setOnClickListener { retryDevice() }
         sinkView = findViewById(R.id.sinkView)
         sinkView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
@@ -134,12 +137,15 @@ class MainActivity : Activity() {
 
     private val stateCallback = object : ICameraHelper.StateCallback {
         override fun onAttach(device: UsbDevice) {
+            if (requestingDevice) return
+            requestingDevice = true
             status("Camera attached — requesting permission…")
             // Triggers the system USB permission dialog (required on GrapheneOS)
             cameraHelper?.selectDevice(device)
         }
 
         override fun onDeviceOpen(device: UsbDevice, isFirstOpen: Boolean) {
+            requestingDevice = false
             val param = com.serenegiant.usb.UVCParam()
             // Thermal cams routinely misreport isochronous bandwidth; always fix it up
             param.quirks = UVCCamera.UVC_QUIRK_FIX_BANDWIDTH
@@ -171,13 +177,34 @@ class MainActivity : Activity() {
         override fun onDeviceClose(device: UsbDevice) {}
 
         override fun onDetach(device: UsbDevice) {
+            requestingDevice = false
+            permissionRetried = false
             status(getString(R.string.waiting))
             runOnUiThread { tempText.text = "" }
         }
 
         override fun onCancel(device: UsbDevice) {
-            status("USB permission denied")
+            requestingDevice = false
+            if (!permissionRetried) {
+                permissionRetried = true
+                status("USB permission denied — retrying in 2s…")
+                mainHandler.postDelayed({ retryDevice() }, 2000)
+            } else {
+                status("USB permission denied — tap this text to retry, or replug the camera")
+            }
         }
+    }
+
+    private fun retryDevice() {
+        val helper = cameraHelper ?: return
+        val device = helper.deviceList?.firstOrNull()
+        if (device == null) {
+            status("No USB camera found — check GrapheneOS Settings → USB peripherals, then replug")
+            return
+        }
+        requestingDevice = true
+        status("Requesting USB permission…")
+        helper.selectDevice(device)
     }
 
     private fun attachSinkIfReady() {
