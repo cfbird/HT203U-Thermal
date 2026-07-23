@@ -6,6 +6,8 @@ import android.hardware.usb.UsbDevice
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.graphics.SurfaceTexture
+import android.view.TextureView
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.ImageView
@@ -27,6 +29,9 @@ class MainActivity : Activity() {
     private lateinit var tempText: TextView
     private lateinit var btnRange: Button
     private lateinit var btnUnit: Button
+    private lateinit var sinkView: TextureView
+    @Volatile private var sinkTexture: SurfaceTexture? = null
+    @Volatile private var sinkAttached = false
 
     private val bitmap: Bitmap =
         Bitmap.createBitmap(Xtherm.WIDTH, Xtherm.HEIGHT, Bitmap.Config.ARGB_8888)
@@ -43,11 +48,26 @@ class MainActivity : Activity() {
     private var tempTable: FloatArray? = null
     private var frameCount = 0L
 
+    private var previewRestarts = 0
+
     private val watchdog = object : Runnable {
         override fun run() {
-            if (cameraHelper != null && rawModeRequested && framesReceived == 0L) {
-                statusText.text =
-                    "Stream started but no frames arriving (last buffer: $lastFrameBytes B) — try replugging"
+            val helper = cameraHelper
+            if (helper != null && rawModeRequested && framesReceived == 0L) {
+                if (previewRestarts < 2 && helper.isCameraOpened) {
+                    // one gentle kick: renegotiate the stream
+                    previewRestarts++
+                    statusText.text = "No frames — restarting stream (attempt $previewRestarts)…"
+                    try {
+                        helper.stopPreview()
+                        helper.startPreview()
+                    } catch (t: Throwable) {
+                        statusText.text = "Stream restart failed: ${t.message}"
+                    }
+                } else {
+                    statusText.text =
+                        "Stream started but no frames arriving (last buffer: $lastFrameBytes B) — try replugging"
+                }
             }
             mainHandler.postDelayed(this, 3000)
         }
@@ -63,6 +83,18 @@ class MainActivity : Activity() {
         tempText = findViewById(R.id.tempText)
         btnRange = findViewById(R.id.btnRange)
         btnUnit = findViewById(R.id.btnUnit)
+        sinkView = findViewById(R.id.sinkView)
+        sinkView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                sinkTexture = st
+                attachSinkIfReady()
+            }
+            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                sinkTexture = null; sinkAttached = false; return true
+            }
+            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+        }
 
         findViewById<Button>(R.id.btnCalibrate).setOnClickListener {
             cameraHelper?.getUVCControl()?.setZoomAbsolute(Xtherm.CMD_CALIBRATE)
@@ -109,7 +141,8 @@ class MainActivity : Activity() {
 
         override fun onDeviceOpen(device: UsbDevice, isFirstOpen: Boolean) {
             val param = com.serenegiant.usb.UVCParam()
-            param.quirks = UVCCamera.getRecommendedPlatformQuirks()
+            // Thermal cams routinely misreport isochronous bandwidth; always fix it up
+            param.quirks = UVCCamera.UVC_QUIRK_FIX_BANDWIDTH
             cameraHelper?.openCamera(param)
         }
 
@@ -121,8 +154,9 @@ class MainActivity : Activity() {
                 return
             }
             helper.previewSize = size
-            helper.startPreview()
             helper.setFrameCallback(frameCallback, UVCCamera.PIXEL_FORMAT_RAW)
+            attachSinkIfReady()
+            helper.startPreview()
             status("Streaming ${size.width}x${size.height} — switching to raw mode…")
             rawModeRequested = false
             // Give the stream a moment to start, then switch to 16-bit radiometric mode
@@ -130,6 +164,7 @@ class MainActivity : Activity() {
         }
 
         override fun onCameraClose(device: UsbDevice) {
+            sinkAttached = false
             status("Camera closed")
         }
 
@@ -142,6 +177,16 @@ class MainActivity : Activity() {
 
         override fun onCancel(device: UsbDevice) {
             status("USB permission denied")
+        }
+    }
+
+    private fun attachSinkIfReady() {
+        val helper = cameraHelper ?: return
+        val st = sinkTexture ?: return
+        if (!sinkAttached && helper.isCameraOpened) {
+            st.setDefaultBufferSize(Xtherm.WIDTH, Xtherm.FRAME_HEIGHT)
+            helper.addSurface(st, false)
+            sinkAttached = true
         }
     }
 
