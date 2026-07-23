@@ -6,6 +6,7 @@ object UsbDesc {
         val sb = StringBuilder("USB descriptors:\n")
         var i = 0
         var inVideoStreaming = false
+        var inVideoControl = false
         while (i + 1 < raw.size) {
             val len = raw[i].toInt() and 0xFF
             if (len < 2 || i + len > raw.size) break
@@ -17,9 +18,23 @@ object UsbDesc {
                     val cls = raw[i + 5].toInt() and 0xFF
                     val sub = raw[i + 6].toInt() and 0xFF
                     inVideoStreaming = cls == 0x0E && sub == 0x02
+                    inVideoControl = cls == 0x0E && sub == 0x01
                     sb.append("IF#%d alt=%d cls=%02x sub=%02x eps=%d\n".format(num, alt, cls, sub, nEp))
                 }
-                0x24 -> if (inVideoStreaming && len >= 5) {
+                0x24 -> if (inVideoControl && len >= 4) {
+                    when (raw[i + 2].toInt() and 0xFF) {
+                        0x02 -> sb.append("  VC input terminal id=%d\n".format(raw[i + 3].toInt() and 0xFF))
+                        0x03 -> sb.append("  VC output terminal id=%d\n".format(raw[i + 3].toInt() and 0xFF))
+                        0x05 -> sb.append("  VC processing unit id=%d\n".format(raw[i + 3].toInt() and 0xFF))
+                        0x06 -> if (len >= 21) { // extension unit: vendor controls live here
+                            val guid = raw.copyOfRange(i + 4, i + 20)
+                            sb.append("  VC XU id=%d numControls=%d guid=%s\n".format(
+                                raw[i + 3].toInt() and 0xFF,
+                                raw[i + 20].toInt() and 0xFF,
+                                guid.joinToString("") { "%02x".format(it) }))
+                        }
+                    }
+                } else if (inVideoStreaming && len >= 5) {
                     when (raw[i + 2].toInt() and 0xFF) {
                         0x04 -> if (len >= 22) { // VS_FORMAT_UNCOMPRESSED
                             val guid = raw.copyOfRange(i + 5, i + 21)

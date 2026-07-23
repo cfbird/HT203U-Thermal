@@ -289,6 +289,21 @@ class MainActivity : Activity() {
         if (pixels.size < n) pixels = IntArray(n)
     }
 
+    /** Fraction of sampled pixels at [off] that fall inside [lo..hi] (±256). */
+    private fun inRange(off: Int, lo: Int, hi: Int): Double {
+        var hit = 0
+        var total = 0
+        var i = off
+        val end = off + Xtherm.PIXELS
+        while (i < end) {
+            val v = frameU16[i].toInt() and 0xFFFF
+            if (v >= lo - 256 && v <= hi + 256) hit++
+            total++
+            i += 97
+        }
+        return if (total == 0) 0.0 else hit.toDouble() / total
+    }
+
     private fun processFrame(frame: ByteBuffer) {
         lastFrameBytes = frame.remaining()
         if (framesReceived == 0L) {
@@ -306,17 +321,32 @@ class MainActivity : Activity() {
         val w = curW
         val h = if (nU16 % w == 0) nU16 / w else curH
 
-        // 1) Xtherm-style meta blocks (256-wide layouts only)
+        // 1) Xtherm-style meta blocks (256-wide layouts only).
+        // The meta's raw min/max tells us which block holds the matching raw
+        // thermal data — HIKMICRO puts a YUY2 display image in one block and
+        // the radiometric array in another.
         if (w == 256) {
             var k = 1
             while (k * 196 <= h) {
                 val base = (k - 1) * 196
                 val meta = Xtherm.parseMeta(frameU16, w * (base + Xtherm.HEIGHT))
                 if (meta != null) {
+                    val cands = ArrayList<Int>(3)
+                    cands.add(w * base)                                            // same block
+                    if (w * (base + 196) + Xtherm.PIXELS <= nU16) cands.add(w * (base + 196)) // next block
+                    if (base >= 196) cands.add(w * (base - 196))                   // previous block
+                    val best = cands.maxByOrNull { inRange(it, meta.minRaw, meta.maxRaw) } ?: (w * base)
                     if (!radiometricSeen) {
-                        radiometricSeen = true; dlog("xtherm meta found in block $k (row $base)")
+                        radiometricSeen = true
+                        dlog("xtherm meta in block $k: minRaw=${meta.minRaw} maxRaw=${meta.maxRaw} " +
+                                "center=${meta.centerRaw} shutter=%.1f fpa=%.1f emiss=%.2f".format(
+                                    meta.tempShutter, meta.tempFpa, meta.emissivity))
+                        dlog("image block scores: " + cands.joinToString {
+                            "row ${it / w}: %.2f".format(inRange(it, meta.minRaw, meta.maxRaw))
+                        } + " -> using row ${best / w}")
                     }
-                    renderXtherm(meta, w * base)
+                    if (frameCount % 300L == 2L) logFrameStats(w, h)
+                    renderXtherm(meta, best)
                     return
                 }
                 k++
